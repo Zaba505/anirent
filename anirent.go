@@ -171,6 +171,36 @@ func (s *Service) Download(ctx context.Context, req *pb.DownloadRequest) (*pb.Do
 	return &pb.DownloadResponse{Subscription: subscription}, nil
 }
 
+// Subscribe
+func (s *Service) Subscribe(req *pb.Subscription, stream pb.Anirent_SubscribeServer) error {
+	errCh := make(chan error, 1)
+
+	unsubscribe, err := s.bus.Subscribe(req.Id, func(event *pb.Event) {
+		err := stream.Send(event)
+		if err != nil {
+			zap.L().Error("unexpected error when sending event", zap.Error(err))
+			errCh <- err
+			close(errCh)
+			return
+		}
+
+		switch event.Payload.(type) {
+		case *pb.Event_Completed:
+			close(errCh)
+		case *pb.Event_Failure:
+			close(errCh)
+		}
+	})
+	if err != nil {
+		zap.L().Error("unexpected error when subscribing to event bus", zap.Error(err))
+		return err
+	}
+	defer unsubscribe()
+
+	err = <-errCh
+	return err
+}
+
 func (s *Service) startDownloader() {
 	go func() {
 		for {
@@ -291,34 +321,4 @@ func (s *Service) publishDone(subId, magnet string, total int64, multiAddr strin
 			},
 		},
 	})
-}
-
-// Subscribe
-func (s *Service) Subscribe(req *pb.Subscription, stream pb.Anirent_SubscribeServer) error {
-	errCh := make(chan error, 1)
-
-	unsubscribe, err := s.bus.Subscribe(req.Id, func(event *pb.Event) {
-		err := stream.Send(event)
-		if err != nil {
-			zap.L().Error("unexpected error when sending event", zap.Error(err))
-			errCh <- err
-			close(errCh)
-			return
-		}
-
-		switch event.Payload.(type) {
-		case *pb.Event_Completed:
-			close(errCh)
-		case *pb.Event_Failure:
-			close(errCh)
-		}
-	})
-	if err != nil {
-		zap.L().Error("unexpected error when subscribing to event bus", zap.Error(err))
-		return err
-	}
-	defer unsubscribe()
-
-	err = <-errCh
-	return err
 }
