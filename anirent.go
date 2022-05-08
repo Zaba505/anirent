@@ -93,6 +93,7 @@ func (s *Service) Serve(ctx context.Context) error {
 		<-errCh
 		return nil
 	case err := <-errCh:
+		close(s.doneCh)
 		return err
 	}
 }
