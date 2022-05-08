@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"path"
 
 	"github.com/Zaba505/anirent/event"
 	"github.com/Zaba505/anirent/parser"
@@ -30,6 +31,7 @@ type Service struct {
 	rander io.Reader
 
 	tc    *torrent.Client
+	dataDir string
 	dq    chan downloadRequest // download queue
 	dOnce sync.Once
 	bus   *event.Bus[*pb.Event]
@@ -54,6 +56,7 @@ func NewService() (*Service, error) {
 	s := &Service{
 		rander: rand.Reader,
 		tc:     c,
+		dataDir: tcfg.DataDir,
 		dq:     make(chan downloadRequest, 1),
 		bus:    event.NewBus[*pb.Event](),
 	}
@@ -218,7 +221,8 @@ func (s *Service) processDownloadRequests() {
 			}
 		}
 
-		s.publishDone(subId, result.Magnet, totalBytes, "")
+		addr := path.Join("/dns/localhost/tcp/20/file", s.dataDir)
+		s.publishDone(subId, result.Magnet, totalBytes, addr)
 	}
 }
 
