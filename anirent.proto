@@ -82,6 +82,9 @@ message DownloadStarted {
 
   // The total size in bytes which will be downloaded.
   int64 total_bytes = 2;
+
+  // Multi-address representing location of downloaded content.
+  string multi_addr = 3;
 }
 
 message DownloadProgress {
@@ -93,6 +96,9 @@ message DownloadProgress {
 
   // Total size in bytes of torrent.
   int64 total_bytes = 3;
+
+  // Multi-address representing location of downloaded content.
+  string multi_addr = 4;
 }
 
 message DownloadComplete {

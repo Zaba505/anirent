@@ -92,6 +92,7 @@ var downloadCmd = &cobra.Command{
 				)
 				bar.ChangeMax64(progress.TotalBytes)
 				bar.Set64(progress.DownloadedBytes)
+				bar.Describe(progress.MultiAddr)
 			case *pb.Event_Completed:
 				done := x.Completed
 

@@ -237,8 +237,11 @@ func (s *Service) processDownloadRequest(dr downloadRequest) {
 		return
 	case <-t.GotInfo():
 	}
+	files := t.Files()
+	fileName := files[0].DisplayPath()
+	addr := path.Join("/dns/localhost/tcp/20/file", s.dataDir, fileName)
 	totalBytes := int64(t.Info().TotalLength())
-	s.publishStarted(subId, result.Magnet, totalBytes)
+	s.publishStarted(subId, result.Magnet, totalBytes, addr)
 
 	t.DisallowDataUpload()
 	t.DownloadAll()
@@ -269,20 +272,17 @@ func (s *Service) processDownloadRequest(dr downloadRequest) {
 		}
 		downloadedBytes = bytesRead
 
-		s.publishProgress(subId, result.Magnet, downloadedBytes, totalBytes)
+		s.publishProgress(subId, result.Magnet, downloadedBytes, totalBytes, addr)
 
 		if downloadedBytes >= totalBytes {
 			break
 		}
 	}
 
-	files := t.Files()
-	fileName := files[0].DisplayPath()
-	addr := path.Join("/dns/localhost/tcp/20/file", s.dataDir, fileName)
 	s.publishDone(subId, result.Magnet, totalBytes, addr)
 }
 
-func (s *Service) publishStarted(subId, magnet string, total int64) {
+func (s *Service) publishStarted(subId, magnet string, total int64, addr string) {
 	s.bus.Publish(subId, &pb.Event{
 		Id:             uuid.Must(uuid.NewRandomFromReader(s.rander)).String(),
 		SubscriptionId: subId,
@@ -290,12 +290,13 @@ func (s *Service) publishStarted(subId, magnet string, total int64) {
 			Started: &pb.DownloadStarted{
 				Magnet:     magnet,
 				TotalBytes: total,
+				MultiAddr:  addr,
 			},
 		},
 	})
 }
 
-func (s *Service) publishProgress(subId, magnet string, downloaded, total int64) {
+func (s *Service) publishProgress(subId, magnet string, downloaded, total int64, addr string) {
 	s.bus.Publish(subId, &pb.Event{
 		Id:             uuid.Must(uuid.NewRandomFromReader(s.rander)).String(),
 		SubscriptionId: subId,
@@ -304,6 +305,7 @@ func (s *Service) publishProgress(subId, magnet string, downloaded, total int64)
 				Magnet:          magnet,
 				DownloadedBytes: downloaded,
 				TotalBytes:      total,
+				MultiAddr:       addr,
 			},
 		},
 	})
