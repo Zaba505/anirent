@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "./proto";
+
+service Anirent {
+  // Search
+  rpc Search (SearchRequest) returns (stream SearchResult);
+
+  // Download
+  rpc Download (DownloadRequest) returns (DownloadResponse);
+
+  // Subscribe
+  rpc Subscribe (Subscription) returns (stream Event);
+}
+
+message SearchRequest {
+  // The name of the anime to search for.
+  string anime_name = 1;
+
+  // Desired resolutions
+  repeated Resolution resolutions = 2;
+}
+
+message SearchResult {
+  // Content name/title e.g. name of anime or name of a movie
+  string name = 1;
+
+  // The video resolution of this result.
+  Resolution resolution = 2;
+
+  // The video file format
+  Format format = 3;
+
+  // The details of this result. This field identifies what type of result
+  // was found. For example, it may represent a single episode or an entire
+  // season of episodes.
+  oneof details {
+    Episode episode = 4;
+    CompleteSeason season = 5;
+  }
+
+  // magnet link for downloading torrent content
+  string magnet = 6;
+}
+
+message DownloadRequest {
+  // The desired search result for downloading.
+  SearchResult result = 1;
+}
+
+message DownloadResponse {
+  Subscription subscription = 1;
+}
+
+message Subscription {
+  string id = 1;
+}
+
+message Event {
+  // The event id.
+  string id = 1;
+
+  // The subscription id which this event corresponds to.
+  string subscription_id = 2;
+
+  oneof payload {
+    DownloadStarted started = 3;
+
+    DownloadProgress progress = 4;
+
+    DownloadComplete completed = 5;
+
+    DownloadFailure failure = 6;
+  }
+}
+
+message DownloadStarted {
+  // The magnet link being downloaded.
+  string magnet = 1;
+
+  // The total size in bytes which will be downloaded.
+  int64 total_bytes = 2;
+}
+
+message DownloadProgress {
+  // The magnet link being downloaded
+  string magnet = 1;
+
+  // Total bytes downloaded so far
+  int64 downloaded_bytes = 2;
+
+  // Total size in bytes of torrent.
+  int64 total_bytes = 3;
+}
+
+message DownloadComplete {
+  // The magnet link which was downloaded
+  string magnet = 1;
+
+  // Total size in bytes of torrent which was downloaded.
+  int64 total_bytes = 2;
+
+  // Multi-address representing location of downloaded content.
+  string multi_addr = 3;
+}
+
+message DownloadFailure {
+  // The magnet link which failed to download.
+  string magnet = 1;
+
+  // The error
+  string error = 2;
+}
+
+enum Format {
+  MKV = 0;
+}
+
+// Resolution represents the desired video resolution e.g. 720p, 1080p, 4k...
+enum Resolution {
+  P_360  = 0;
+  P_480  = 1;
+  P_720  = 2;
+  P_1080 = 3;
+  P_2160 = 4;
+  K_4    = 5;
+}
+
+message Episode {
+  // The season this episode belongs to.
+  int64 season = 1;
+
+  // Where this episode falls in the order of all the episodes
+  // belonging to the given season.
+  int64 number = 2;
+}
+
+message CompleteSeason {
+  // Where this season falls in the order of all the anime's seasons.
+  int64 number = 1;
+
+  repeated Episode episodes = 2;
+}
