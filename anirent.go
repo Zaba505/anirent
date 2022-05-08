@@ -7,9 +7,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
 	"sync"
 	"time"
-	"path"
 
 	"github.com/Zaba505/anirent/event"
 	"github.com/Zaba505/anirent/parser"
@@ -28,13 +28,14 @@ import (
 type Service struct {
 	pb.UnimplementedAnirentServer
 
+	doneCh chan struct{}
 	rander io.Reader
 
-	tc    *torrent.Client
+	tc      *torrent.Client
 	dataDir string
-	dq    chan downloadRequest // download queue
-	dOnce sync.Once
-	bus   *event.Bus[*pb.Event]
+	dq      chan downloadRequest // download queue
+	dOnce   sync.Once
+	bus     *event.Bus[*pb.Event]
 }
 
 // NewService
@@ -54,11 +55,12 @@ func NewService() (*Service, error) {
 	}
 
 	s := &Service{
-		rander: rand.Reader,
-		tc:     c,
+		doneCh:  make(chan struct{}, 1),
+		rander:  rand.Reader,
+		tc:      c,
 		dataDir: tcfg.DataDir,
-		dq:     make(chan downloadRequest, 1),
-		bus:    event.NewBus[*pb.Event](),
+		dq:      make(chan downloadRequest, 1),
+		bus:     event.NewBus[*pb.Event](),
 	}
 	return s, nil
 }
@@ -86,6 +88,7 @@ func (s *Service) Serve(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		close(s.doneCh)
 		grpcServer.GracefulStop()
 		<-errCh
 		return nil
@@ -168,62 +171,84 @@ func (s *Service) Download(ctx context.Context, req *pb.DownloadRequest) (*pb.Do
 }
 
 func (s *Service) startDownloader() {
-	go s.processDownloadRequests()
+	go func() {
+		for {
+			select {
+			case <-s.doneCh:
+				return
+			case dr := <-s.dq:
+				go s.processDownloadRequest(dr)
+			}
+		}
+	}()
 }
 
-func (s *Service) processDownloadRequests() {
-	for dr := range s.dq {
-		subId := dr.subscriptionId
+func (s *Service) processDownloadRequest(dr downloadRequest) {
+	subId := dr.subscriptionId
 
-		result := dr.result
-		zap.L().Info("starting download", zap.String("magnet", result.Magnet))
+	result := dr.result
+	zap.L().Info("starting download", zap.String("magnet", result.Magnet))
 
-		t, err := s.tc.AddMagnet(result.Magnet)
-		if err != nil {
-			zap.L().Error(
-				"unexpected error when adding magnet to torrent client",
-				zap.String("magnet", result.Magnet),
-				zap.Error(err),
-			)
+	t, err := s.tc.AddMagnet(result.Magnet)
+	if err != nil {
+		zap.L().Error(
+			"unexpected error when adding magnet to torrent client",
+			zap.String("magnet", result.Magnet),
+			zap.Error(err),
+		)
+		return
+	}
+
+	select {
+	case <-s.doneCh:
+		// TODO: cleanup
+		zap.L().Warn("service shutdown before torrent download could start", zap.String("magnet", result.Magnet))
+		return
+	case <-t.GotInfo():
+	}
+	totalBytes := int64(t.Info().TotalLength())
+	s.publishStarted(subId, result.Magnet, totalBytes)
+
+	t.DisallowDataUpload()
+	t.DownloadAll()
+	defer t.Drop()
+
+	downloadedBytes := int64(0)
+	for {
+		select {
+		case <-s.doneCh:
+			// TODO: cleanup
+			zap.L().Warn("service shutdown before torrent download could complete", zap.String("magnet", result.Magnet))
+			return
+		case <-time.After(1 * time.Second):
+		}
+
+		stats := t.Stats()
+		bytesRead := stats.BytesReadData.Int64()
+
+		zap.L().Info(
+			"stats",
+			zap.Int("active_peers", stats.ActivePeers),
+			zap.Int("total_peers", stats.TotalPeers),
+			zap.Int64("bytes_read", bytesRead),
+		)
+
+		if downloadedBytes == bytesRead {
 			continue
 		}
+		downloadedBytes = bytesRead
 
-		<-t.GotInfo()
-		totalBytes := int64(t.Info().TotalLength())
-		s.publishStarted(subId, result.Magnet, totalBytes)
+		s.publishProgress(subId, result.Magnet, downloadedBytes, totalBytes)
 
-		t.DisallowDataUpload()
-		t.DownloadAll()
-
-		downloadedBytes := int64(0)
-		for {
-			<-time.After(1 * time.Second)
-
-			stats := t.Stats()
-			bytesRead := stats.BytesReadData.Int64()
-
-			zap.L().Info(
-				"stats",
-				zap.Int("active_peers", stats.ActivePeers),
-				zap.Int("total_peers", stats.TotalPeers),
-				zap.Int64("bytes_read", bytesRead),
-			)
-
-			if downloadedBytes == bytesRead {
-				continue
-			}
-			downloadedBytes = bytesRead
-
-			s.publishProgress(subId, result.Magnet, downloadedBytes, totalBytes)
-
-			if downloadedBytes >= totalBytes {
-				break
-			}
+		if downloadedBytes >= totalBytes {
+			break
 		}
-
-		addr := path.Join("/dns/localhost/tcp/20/file", s.dataDir)
-		s.publishDone(subId, result.Magnet, totalBytes, addr)
 	}
+
+	files := t.Files()
+	fileName := files[0].DisplayPath()
+	addr := path.Join("/dns/localhost/tcp/20/file", s.dataDir, fileName)
+	s.publishDone(subId, result.Magnet, totalBytes, addr)
 }
 
 func (s *Service) publishStarted(subId, magnet string, total int64) {
