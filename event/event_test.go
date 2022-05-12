@@ -36,7 +36,7 @@ func TestBus(t *testing.T) {
 
 		<-time.After(50 * time.Millisecond)
 		unsubscribe()
-    close(doneCh)
+		close(doneCh)
 
 		// len(evs) == 50 +- 10
 		assert.InDelta(subT, 50, len(evs), 10)
