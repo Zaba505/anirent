@@ -18,3 +18,11 @@ type Interface interface {
 	// Search
 	Search(ctx context.Context, query string, resultCh chan<- *Result) error
 }
+
+// InterfaceFunc
+type InterfaceFunc func(context.Context, string, chan<- *Result) error
+
+// Search
+func (f InterfaceFunc) Search(ctx context.Context, query string, resultCh chan<- *Result) error {
+	return f(ctx, query, resultCh)
+}
