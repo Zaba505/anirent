@@ -56,7 +56,7 @@ var subspleaseCmd = &cobra.Command{
 			return
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(cmd.Context())
 		go func() {
 			defer cancel()
 
