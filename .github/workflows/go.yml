@@ -1,5 +1,8 @@
 name: Go
 
+env:
+  ENV: ci
+
 on:
   push:
     branches: [ main ]

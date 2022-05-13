@@ -3,11 +3,18 @@ package searchengine
 import (
 	"context"
 	"testing"
+	"os"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestBTDigg(t *testing.T) {
+	env := os.Getenv("ENV")
+	if env == "ci" {
+		t.Skip("skipping torrent based test while in ci env")
+		return
+	}
+
 	t.Run("should return multiple pages of results", func(subT *testing.T) {
 		resultCh := make(chan *Result)
 		errCh := make(chan error, 1)
