@@ -14,12 +14,14 @@ import (
 	"github.com/Zaba505/anirent/event"
 	"github.com/Zaba505/anirent/parser"
 	pb "github.com/Zaba505/anirent/proto"
+	"github.com/Zaba505/anirent/searchengine"
 
 	"github.com/anacrolix/dht/v2"
 	"github.com/anacrolix/log"
 	"github.com/anacrolix/torrent"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -30,7 +32,14 @@ type Service struct {
 
 	doneCh chan struct{}
 	rander io.Reader
+	ls     net.Listener
 
+	// search config
+	se searchengine.Interface
+
+	// download config
+	tcOnce  sync.Once
+	tcErr   error
 	tc      *torrent.Client
 	dataDir string
 	dq      chan downloadRequest // download queue
@@ -38,30 +47,51 @@ type Service struct {
 	bus     *event.Bus[*pb.Event]
 }
 
+// A AnirentOption sets an option on a Anirent service.
+type AnirentOption func(*Service)
+
+// WithListener allows a custom net.Listener to be provided.
+//
+// The default listener will listen on ":8080".
+//
+func WithListener(ls net.Listener) AnirentOption {
+	return func(s *Service) {
+		s.ls = ls
+	}
+}
+
+// SearchEngine sets the search engine to use for querying for torrents.
+//
+// The default search engine is BTDigg.
+//
+func SearchEngine(se searchengine.Interface) AnirentOption {
+	return func(s *Service) {
+		s.se = se
+	}
+}
+
+// TorrentDir is the directory where torrents are downloaded to.
+func TorrentDir(dir string) AnirentOption {
+	return func(s *Service) {
+		s.dataDir = dir
+	}
+}
+
 // NewService
-func NewService() (*Service, error) {
-	tcfg := torrent.NewDefaultClientConfig()
-	tcfg.ConfigureAnacrolixDhtServer = func(cfg *dht.ServerConfig) {
-		cfg.Logger = log.Default.FilterLevel(log.Error)
-	}
-	tcfg.NoUpload = true
-	tcfg.HTTPUserAgent = "anirent"
-	tcfg.Logger = log.Default.FilterLevel(log.Error)
-	tcfg.DataDir = os.TempDir()
-
-	c, err := torrent.NewClient(tcfg)
-	if err != nil {
-		return nil, err
-	}
-
+func NewService(opts ...AnirentOption) (*Service, error) {
 	s := &Service{
+		se:      &searchengine.BTDigg{},
 		doneCh:  make(chan struct{}, 1),
 		rander:  rand.Reader,
-		tc:      c,
-		dataDir: tcfg.DataDir,
+		dataDir: os.TempDir(),
 		dq:      make(chan downloadRequest, 1),
 		bus:     event.NewBus[*pb.Event](),
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
 	return s, nil
 }
 
@@ -70,7 +100,10 @@ func NewService() (*Service, error) {
 // provided context can be used to gracefully shutdown the server.
 //
 func (s *Service) Serve(ctx context.Context) error {
-	ls, err := net.Listen("tcp", ":8080")
+	var err error
+	if s.ls == nil {
+		s.ls, err = net.Listen("tcp", ":8080")
+	}
 	if err != nil {
 		return err
 	}
@@ -79,12 +112,15 @@ func (s *Service) Serve(ctx context.Context) error {
 	pb.RegisterAnirentServer(grpcServer, s)
 
 	errCh := make(chan error, 1)
-	go func() {
+	go func(ls net.Listener) {
 		defer close(errCh)
+
+		addr := ls.Addr()
+		zap.L().Info("anirent started", zap.String("network", addr.Network()), zap.String("addr", addr.String()))
 
 		err := grpcServer.Serve(ls)
 		errCh <- err
-	}()
+	}(s.ls)
 
 	select {
 	case <-ctx.Done():
@@ -100,47 +136,110 @@ func (s *Service) Serve(ctx context.Context) error {
 
 // Search
 func (s *Service) Search(req *pb.SearchRequest, stream pb.Anirent_SearchServer) error {
-	resultCh := make(chan scrapeResult, 10)
-	go func() {
-		err := scrape(context.Background(), req, resultCh)
-		if err != nil {
-			fmt.Println(err)
+	resultChs := make([]<-chan *searchengine.Result, 0, len(req.Resolutions))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	g, gctx := errgroup.WithContext(ctx)
+	for _, resolution := range req.Resolutions {
+		resolution := resolution
+		resultCh := make(chan *searchengine.Result, 10)
+		resultChs = append(resultChs, resultCh)
+
+		g.Go(func() error {
+			zap.L().Debug("searching", zap.String("anime", req.AnimeName), zap.String("resolution", resolution.String()))
+			return s.search(gctx, req.AnimeName, resolution, resultCh)
+		})
+	}
+
+	resultCh := merge(gctx.Done(), resultChs...)
+	g.Go(func() error {
+		for {
+			select {
+			case <-gctx.Done():
+				zap.L().Warn("context was cancelled before search results were completely processed")
+				return gctx.Err()
+			case scrapeRes := <-resultCh:
+				if scrapeRes == nil {
+					return nil
+				}
+				zap.L().Debug(
+					"received search engine result",
+					zap.String("torrent", scrapeRes.TorrentName),
+					zap.String("magnet", scrapeRes.Magnet),
+				)
+
+				torrentName := scrapeRes.TorrentName
+
+				zap.L().Debug("parsing scraping result", zap.String("torrent_name", torrentName))
+
+				searchResult, err := parser.Parse(torrentName)
+				if err != nil {
+					zap.L().Error("unexpected error when parsing torrent name", zap.String("torrent_name", torrentName), zap.Error(err))
+					continue
+				}
+				searchResult.Magnet = scrapeRes.Magnet
+
+				var typ string
+				switch searchResult.Details.(type) {
+				case *pb.SearchResult_Episode:
+					typ = "episode"
+				case *pb.SearchResult_Season:
+					typ = "season"
+				}
+
+				zap.L().Debug(
+					"parsed torrent result",
+					zap.String("name", searchResult.Name),
+					zap.String("resolution", parser.SprintResolution(searchResult.Resolution).String()),
+					zap.String("type", typ),
+				)
+
+				err = stream.Send(searchResult)
+				if err != nil {
+					zap.L().Error("unexpected error when sending search result", zap.Error(err))
+				}
+			}
 		}
-	}()
+	})
 
-	for scrapeRes := range resultCh {
-		torrentName := scrapeRes.TorrentName
+	zap.L().Debug("waiting for search to complete")
+	return g.Wait()
+}
 
-		zap.L().Debug("parsing scraping result", zap.String("torrent_name", torrentName))
+func (s *Service) search(ctx context.Context, name string, resolution pb.Resolution, resultCh chan<- *searchengine.Result) error {
+	res := parser.SprintResolution(resolution)
+	query := fmt.Sprintf("[SubsPlease] %s (%s)", name, res)
+	return s.se.Search(ctx, query, resultCh)
+}
 
-		searchResult, err := parser.Parse(torrentName)
-		if err != nil {
-			zap.L().Error("unexpected error when parsing torrent name", zap.String("torrent_name", torrentName), zap.Error(err))
-			continue
-		}
-		searchResult.Magnet = scrapeRes.Magnet
+func merge[T any](done <-chan struct{}, channels ...<-chan T) <-chan T {
+	var wg sync.WaitGroup
 
-		var typ string
-		switch searchResult.Details.(type) {
-		case *pb.SearchResult_Episode:
-			typ = "episode"
-		case *pb.SearchResult_Season:
-			typ = "season"
-		}
-
-		zap.L().Debug(
-			"parsed torrent result",
-			zap.String("name", searchResult.Name),
-			zap.String("resolution", parser.SprintResolution(searchResult.Resolution).String()),
-			zap.String("type", typ),
-		)
-
-		err = stream.Send(searchResult)
-		if err != nil {
-			zap.L().Error("unexpected error when sending search result", zap.Error(err))
+	wg.Add(len(channels))
+	fanIn := make(chan T)
+	multiplex := func(c <-chan T) {
+		defer wg.Done()
+		for i := range c {
+			select {
+			case <-done:
+				return
+			case fanIn <- i:
+			}
 		}
 	}
-	return nil
+	for _, c := range channels {
+		if c == nil {
+			break
+		}
+		go multiplex(c)
+	}
+	go func() {
+		wg.Wait()
+		close(fanIn)
+	}()
+	return fanIn
 }
 
 type downloadRequest struct {
@@ -150,6 +249,10 @@ type downloadRequest struct {
 
 // Download
 func (s *Service) Download(ctx context.Context, req *pb.DownloadRequest) (*pb.DownloadResponse, error) {
+	s.tcOnce.Do(s.startTorrentClient)
+	if s.tcErr != nil {
+		return nil, s.tcErr
+	}
 	s.dOnce.Do(s.startDownloader)
 
 	id := uuid.Must(uuid.NewRandomFromReader(s.rander)).String()
@@ -199,6 +302,24 @@ func (s *Service) Subscribe(req *pb.Subscription, stream pb.Anirent_SubscribeSer
 
 	err = <-errCh
 	return err
+}
+
+func (s *Service) startTorrentClient() {
+	tcfg := torrent.NewDefaultClientConfig()
+	tcfg.ConfigureAnacrolixDhtServer = func(cfg *dht.ServerConfig) {
+		cfg.Logger = log.Default.FilterLevel(log.Error)
+	}
+	tcfg.NoUpload = true
+	tcfg.HTTPUserAgent = "anirent"
+	tcfg.Logger = log.Default.FilterLevel(log.Error)
+	tcfg.DataDir = s.dataDir
+
+	c, err := torrent.NewClient(tcfg)
+	if err != nil {
+		s.tcErr = err
+		return
+	}
+	s.tc = c
 }
 
 func (s *Service) startDownloader() {
