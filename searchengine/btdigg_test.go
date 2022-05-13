@@ -2,8 +2,8 @@ package searchengine
 
 import (
 	"context"
-	"testing"
 	"os"
+	"testing"
 
 	"github.com/stretchr/testify/assert"
 )

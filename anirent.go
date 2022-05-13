@@ -32,11 +32,14 @@ type Service struct {
 
 	doneCh chan struct{}
 	rander io.Reader
+	ls     net.Listener
 
 	// search config
 	se searchengine.Interface
 
 	// download config
+	tcOnce  sync.Once
+	tcErr   error
 	tc      *torrent.Client
 	dataDir string
 	dq      chan downloadRequest // download queue
@@ -46,6 +49,16 @@ type Service struct {
 
 // A AnirentOption sets an option on a Anirent service.
 type AnirentOption func(*Service)
+
+// WithListener allows a custom net.Listener to be provided.
+//
+// The default listener will listen on ":8080".
+//
+func WithListener(ls net.Listener) AnirentOption {
+	return func(s *Service) {
+		s.ls = ls
+	}
+}
 
 // SearchEngine sets the search engine to use for querying for torrents.
 //
@@ -57,7 +70,7 @@ func SearchEngine(se searchengine.Interface) AnirentOption {
 	}
 }
 
-// TorrentDir is the directory where are torrents are downloaded to.
+// TorrentDir is the directory where torrents are downloaded to.
 func TorrentDir(dir string) AnirentOption {
 	return func(s *Service) {
 		s.dataDir = dir
@@ -79,21 +92,6 @@ func NewService(opts ...AnirentOption) (*Service, error) {
 		opt(s)
 	}
 
-	tcfg := torrent.NewDefaultClientConfig()
-	tcfg.ConfigureAnacrolixDhtServer = func(cfg *dht.ServerConfig) {
-		cfg.Logger = log.Default.FilterLevel(log.Error)
-	}
-	tcfg.NoUpload = true
-	tcfg.HTTPUserAgent = "anirent"
-	tcfg.Logger = log.Default.FilterLevel(log.Error)
-	tcfg.DataDir = s.dataDir
-
-	c, err := torrent.NewClient(tcfg)
-	if err != nil {
-		return nil, err
-	}
-	s.tc = c
-
 	return s, nil
 }
 
@@ -102,7 +100,10 @@ func NewService(opts ...AnirentOption) (*Service, error) {
 // provided context can be used to gracefully shutdown the server.
 //
 func (s *Service) Serve(ctx context.Context) error {
-	ls, err := net.Listen("tcp", ":8080")
+	var err error
+	if s.ls == nil {
+		s.ls, err = net.Listen("tcp", ":8080")
+	}
 	if err != nil {
 		return err
 	}
@@ -111,12 +112,15 @@ func (s *Service) Serve(ctx context.Context) error {
 	pb.RegisterAnirentServer(grpcServer, s)
 
 	errCh := make(chan error, 1)
-	go func() {
+	go func(ls net.Listener) {
 		defer close(errCh)
+
+		addr := ls.Addr()
+		zap.L().Info("anirent started", zap.String("network", addr.Network()), zap.String("addr", addr.String()))
 
 		err := grpcServer.Serve(ls)
 		errCh <- err
-	}()
+	}(s.ls)
 
 	select {
 	case <-ctx.Done():
@@ -245,6 +249,10 @@ type downloadRequest struct {
 
 // Download
 func (s *Service) Download(ctx context.Context, req *pb.DownloadRequest) (*pb.DownloadResponse, error) {
+	s.tcOnce.Do(s.startTorrentClient)
+	if s.tcErr != nil {
+		return nil, s.tcErr
+	}
 	s.dOnce.Do(s.startDownloader)
 
 	id := uuid.Must(uuid.NewRandomFromReader(s.rander)).String()
@@ -294,6 +302,24 @@ func (s *Service) Subscribe(req *pb.Subscription, stream pb.Anirent_SubscribeSer
 
 	err = <-errCh
 	return err
+}
+
+func (s *Service) startTorrentClient() {
+	tcfg := torrent.NewDefaultClientConfig()
+	tcfg.ConfigureAnacrolixDhtServer = func(cfg *dht.ServerConfig) {
+		cfg.Logger = log.Default.FilterLevel(log.Error)
+	}
+	tcfg.NoUpload = true
+	tcfg.HTTPUserAgent = "anirent"
+	tcfg.Logger = log.Default.FilterLevel(log.Error)
+	tcfg.DataDir = s.dataDir
+
+	c, err := torrent.NewClient(tcfg)
+	if err != nil {
+		s.tcErr = err
+		return
+	}
+	s.tc = c
 }
 
 func (s *Service) startDownloader() {
